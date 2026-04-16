@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+*.o
+*.skel.h
+
+# Generated kernel headers
+src/bpf/vmlinux.h
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Secrets & environment
+.env
+.env.*
+*.pem
+*.key
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Dependency directories
+node_modules/
