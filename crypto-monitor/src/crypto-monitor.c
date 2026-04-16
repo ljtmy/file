@@ -1,5 +1,7 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -7,6 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -57,6 +61,43 @@ static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
   return vfprintf(stderr, format, args);
 }
 
+static int safe_parse_int(const char *str, int min_val, int max_val,
+                          int *result) {
+  char *endptr = NULL;
+  long val;
+
+  errno = 0;
+  val = strtol(str, &endptr, 10);
+
+  if (errno != 0 || endptr == str || *endptr != '\0') {
+    return -EINVAL;
+  }
+
+  if (val < min_val || val > max_val) {
+    return -ERANGE;
+  }
+
+  *result = (int)val;
+  return 0;
+}
+
+static bool is_safe_output_path(const char *path) {
+  if (!path || path[0] == '\0') {
+    return false;
+  }
+
+  if (strncmp(path, "/dev/", 5) == 0 || strncmp(path, "/proc/", 6) == 0 ||
+      strncmp(path, "/sys/", 5) == 0) {
+    return false;
+  }
+
+  if (strstr(path, "..") != NULL) {
+    return false;
+  }
+
+  return true;
+}
+
 static void usage(const char *prog) {
   fprintf(stderr,
           "Usage: %s [OPTIONS]\n"
@@ -93,24 +134,48 @@ static int parse_args(int argc, char **argv, struct cli_options *opts) {
   while ((opt = getopt_long(argc, argv, "p:t:b:s:i:d:o:f:h", long_options,
                             NULL)) != -1) {
     switch (opt) {
-      case 'p':
-        opts->pid = (pid_t)atoi(optarg);
+      case 'p': {
+        int pid_val;
+        if (safe_parse_int(optarg, 1, INT_MAX, &pid_val) != 0) {
+          fprintf(stderr, "--pid: invalid process id '%s'\n", optarg);
+          return -1;
+        }
+        opts->pid = (pid_t)pid_val;
         break;
-      case 't':
-        opts->tid = (pid_t)atoi(optarg);
+      }
+      case 't': {
+        int tid_val;
+        if (safe_parse_int(optarg, 1, INT_MAX, &tid_val) != 0) {
+          fprintf(stderr, "--tid: invalid thread id '%s'\n", optarg);
+          return -1;
+        }
+        opts->tid = (pid_t)tid_val;
         break;
+      }
       case 'b':
         opts->binary_path = optarg;
         break;
       case 's':
         opts->symbol = optarg;
         break;
-      case 'i':
-        opts->interval_sec = atoi(optarg);
+      case 'i': {
+        int interval_val;
+        if (safe_parse_int(optarg, 1, 86400, &interval_val) != 0) {
+          fprintf(stderr, "--interval: must be 1..86400, got '%s'\n", optarg);
+          return -1;
+        }
+        opts->interval_sec = interval_val;
         break;
-      case 'd':
-        opts->duration_sec = atoi(optarg);
+      }
+      case 'd': {
+        int duration_val;
+        if (safe_parse_int(optarg, 0, 86400, &duration_val) != 0) {
+          fprintf(stderr, "--duration: must be 0..86400, got '%s'\n", optarg);
+          return -1;
+        }
+        opts->duration_sec = duration_val;
         break;
+      }
       case 'o':
         opts->output_path = optarg;
         break;
@@ -129,26 +194,47 @@ static int parse_args(int argc, char **argv, struct cli_options *opts) {
     return -1;
   }
 
-  if (opts->interval_sec <= 0) {
-    fprintf(stderr, "--interval must be > 0\n");
-    return -1;
-  }
-
   if (strcmp(opts->output_format, "json") != 0 &&
       strcmp(opts->output_format, "csv") != 0) {
     fprintf(stderr, "--format must be json or csv\n");
     return -1;
   }
 
+  if (opts->output_path && !is_safe_output_path(opts->output_path)) {
+    fprintf(stderr,
+            "--output: unsafe path '%s' (must not target /dev, /proc, /sys or "
+            "contain '..')\n",
+            opts->output_path);
+    return -1;
+  }
+
   return 0;
 }
 
-static int bump_memlock_rlimit(void) {
-  struct rlimit rlim = {
-      .rlim_cur = RLIM_INFINITY,
-      .rlim_max = RLIM_INFINITY,
-  };
+static bool kernel_has_memcg_accounting(void) {
+  struct utsname uts;
+  int major = 0;
+  int minor = 0;
 
+  if (uname(&uts) != 0) {
+    return false;
+  }
+  if (sscanf(uts.release, "%d.%d", &major, &minor) < 2) {
+    return false;
+  }
+
+  return major > 5 || (major == 5 && minor >= 11);
+}
+
+static int bump_memlock_rlimit(void) {
+  struct rlimit rlim;
+
+  if (kernel_has_memcg_accounting()) {
+    return 0;
+  }
+
+  rlim.rlim_cur = RLIM_INFINITY;
+  rlim.rlim_max = RLIM_INFINITY;
   return setrlimit(RLIMIT_MEMLOCK, &rlim);
 }
 
@@ -325,8 +411,26 @@ static void print_snapshot(const struct aggregate_snapshot *curr,
          (unsigned long long)curr->crypto_errors);
 }
 
+static FILE *open_output_file(const char *path) {
+  int fd;
+  FILE *fp;
+
+  fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) {
+    return NULL;
+  }
+
+  fp = fdopen(fd, "w");
+  if (!fp) {
+    close(fd);
+    return NULL;
+  }
+
+  return fp;
+}
+
 static int write_json(const char *path, const struct aggregate_snapshot *snap) {
-  FILE *fp = fopen(path, "w");
+  FILE *fp = open_output_file(path);
   size_t i;
 
   if (!fp) {
@@ -369,7 +473,7 @@ static int write_json(const char *path, const struct aggregate_snapshot *snap) {
 }
 
 static int write_csv(const char *path, const struct aggregate_snapshot *snap) {
-  FILE *fp = fopen(path, "w");
+  FILE *fp = open_output_file(path);
   size_t i;
 
   if (!fp) {
