@@ -1,0 +1,12 @@
+# Build artifacts
+build/
+
+# Editor/IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Generated kernel headers
+src/bpf/vmlinux.h

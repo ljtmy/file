@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <getopt.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -7,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -93,24 +95,60 @@ static int parse_args(int argc, char **argv, struct cli_options *opts) {
   while ((opt = getopt_long(argc, argv, "p:t:b:s:i:d:o:f:h", long_options,
                             NULL)) != -1) {
     switch (opt) {
-      case 'p':
-        opts->pid = (pid_t)atoi(optarg);
+      case 'p': {
+        char *endptr;
+        long val;
+        errno = 0;
+        val = strtol(optarg, &endptr, 10);
+        if (errno != 0 || *endptr != '\0' || val <= 0 || val > INT_MAX) {
+          fprintf(stderr, "--pid: invalid value '%s'\n", optarg);
+          return -1;
+        }
+        opts->pid = (pid_t)val;
         break;
-      case 't':
-        opts->tid = (pid_t)atoi(optarg);
+      }
+      case 't': {
+        char *endptr;
+        long val;
+        errno = 0;
+        val = strtol(optarg, &endptr, 10);
+        if (errno != 0 || *endptr != '\0' || val <= 0 || val > INT_MAX) {
+          fprintf(stderr, "--tid: invalid value '%s'\n", optarg);
+          return -1;
+        }
+        opts->tid = (pid_t)val;
         break;
+      }
       case 'b':
         opts->binary_path = optarg;
         break;
       case 's':
         opts->symbol = optarg;
         break;
-      case 'i':
-        opts->interval_sec = atoi(optarg);
+      case 'i': {
+        char *endptr;
+        long val;
+        errno = 0;
+        val = strtol(optarg, &endptr, 10);
+        if (errno != 0 || *endptr != '\0' || val <= 0 || val > INT_MAX) {
+          fprintf(stderr, "--interval: invalid value '%s'\n", optarg);
+          return -1;
+        }
+        opts->interval_sec = (int)val;
         break;
-      case 'd':
-        opts->duration_sec = atoi(optarg);
+      }
+      case 'd': {
+        char *endptr;
+        long val;
+        errno = 0;
+        val = strtol(optarg, &endptr, 10);
+        if (errno != 0 || *endptr != '\0' || val < 0 || val > INT_MAX) {
+          fprintf(stderr, "--duration: invalid value '%s'\n", optarg);
+          return -1;
+        }
+        opts->duration_sec = (int)val;
         break;
+      }
       case 'o':
         opts->output_path = optarg;
         break;
@@ -143,12 +181,20 @@ static int parse_args(int argc, char **argv, struct cli_options *opts) {
   return 0;
 }
 
+#define MEMLOCK_LIMIT_BYTES (128ULL * 1024 * 1024)
+
 static int bump_memlock_rlimit(void) {
   struct rlimit rlim = {
-      .rlim_cur = RLIM_INFINITY,
-      .rlim_max = RLIM_INFINITY,
+      .rlim_cur = MEMLOCK_LIMIT_BYTES,
+      .rlim_max = MEMLOCK_LIMIT_BYTES,
   };
 
+  if (setrlimit(RLIMIT_MEMLOCK, &rlim) == 0) {
+    return 0;
+  }
+
+  rlim.rlim_cur = RLIM_INFINITY;
+  rlim.rlim_max = RLIM_INFINITY;
   return setrlimit(RLIMIT_MEMLOCK, &rlim);
 }
 
@@ -315,6 +361,10 @@ static void print_snapshot(const struct aggregate_snapshot *curr,
     avg_sched_us = (double)delta_sched_total_ns / delta_sched_samples / 1000.0;
   }
 
+  if (interval_sec <= 0) {
+    return;
+  }
+
   printf("[%s] calls/s=%llu switches/s=%llu cpu=%.2f%% avg_sched=%.2fus "
          "p50=%.2fus p95=%.2fus max=%.2fus errors=%llu\n",
          timebuf, (unsigned long long)(delta_crypto / interval_sec),
@@ -400,10 +450,38 @@ static int write_csv(const char *path, const struct aggregate_snapshot *snap) {
   return 0;
 }
 
+static bool is_safe_output_path(const char *path) {
+  static const char *const blocked_prefixes[] = {
+      "/proc/", "/sys/",  "/dev/",     "/boot/",
+      "/sbin/", "/bin/",  "/usr/bin/", "/usr/sbin/",
+      "/etc/",  "/lib/",  "/lib64/",   "/usr/lib/",
+      "/usr/lib64/",
+  };
+  size_t i;
+
+  if (!path || path[0] == '\0') {
+    return false;
+  }
+
+  for (i = 0; i < sizeof(blocked_prefixes) / sizeof(blocked_prefixes[0]); i++) {
+    if (strncmp(path, blocked_prefixes[i], strlen(blocked_prefixes[i])) == 0) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 static int export_snapshot(const struct cli_options *opts,
                            const struct aggregate_snapshot *snap) {
   if (!opts->output_path) {
     return 0;
+  }
+
+  if (!is_safe_output_path(opts->output_path)) {
+    fprintf(stderr, "refusing to write to sensitive path: %s\n",
+            opts->output_path);
+    return -EPERM;
   }
 
   if (strcmp(opts->output_format, "csv") == 0) {
