@@ -89,15 +89,19 @@ static __always_inline bool match_target_tgid(__u32 tgid) {
   return tracked != NULL;
 }
 
-static __always_inline bool match_sched_target(__u32 tid) {
+static __always_inline bool match_tracked_tid(__u32 tid) {
   __u8 *tracked;
 
+  tracked = bpf_map_lookup_elem(&tracked_tids, &tid);
+  return tracked != NULL;
+}
+
+static __always_inline bool match_sched_target(__u32 tid) {
   if (target_tid) {
     return target_tid == tid;
   }
 
-  tracked = bpf_map_lookup_elem(&tracked_tids, &tid);
-  return tracked != NULL;
+  return match_tracked_tid(tid);
 }
 
 static __always_inline struct thread_metrics *get_or_init_metrics(__u32 tid) {
@@ -184,6 +188,11 @@ int handle_sched_process_fork(struct trace_event_raw_sched_process_fork *ctx) {
 
   if (parent_pid == target_tgid || match_target_tgid(parent_pid)) {
     bpf_map_update_elem(&tracked_tgids, &child_pid, &tracked, BPF_ANY);
+  }
+
+  if (parent_pid == target_tid || match_tracked_tid(parent_pid) ||
+      parent_pid == target_tgid || match_target_tgid(parent_pid)) {
+    bpf_map_update_elem(&tracked_tids, &child_pid, &tracked, BPF_ANY);
   }
 
   return 0;

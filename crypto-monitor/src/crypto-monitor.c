@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <dirent.h>
 #include <getopt.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -152,21 +153,81 @@ static int bump_memlock_rlimit(void) {
   return setrlimit(RLIMIT_MEMLOCK, &rlim);
 }
 
-static int seed_tracked_tgid(int map_fd, pid_t pid, int depth) {
+static int seed_single_id(int map_fd, __u32 key) {
+  __u8 value = 1;
+
+  if (bpf_map_update_elem(map_fd, &key, &value, BPF_ANY) != 0) {
+    return -errno;
+  }
+
+  return 0;
+}
+
+static int seed_tracked_tids_for_pid(int tid_map_fd, pid_t pid) {
+  char path[128];
+  DIR *dir;
+  struct dirent *entry;
+  int written;
+
+  written = snprintf(path, sizeof(path), "/proc/%d/task", pid);
+  if (written < 0 || (size_t)written >= sizeof(path)) {
+    return -ENAMETOOLONG;
+  }
+
+  dir = opendir(path);
+  if (!dir) {
+    return errno == ENOENT ? 0 : -errno;
+  }
+
+  while ((entry = readdir(dir)) != NULL) {
+    char *end = NULL;
+    long tid;
+    int err;
+
+    if (entry->d_name[0] == '.') {
+      continue;
+    }
+
+    tid = strtol(entry->d_name, &end, 10);
+    if (end == entry->d_name || *end != '\0' || tid <= 0) {
+      continue;
+    }
+
+    err = seed_single_id(tid_map_fd, (__u32)tid);
+    if (err != 0) {
+      closedir(dir);
+      return err;
+    }
+  }
+
+  closedir(dir);
+  return 0;
+}
+
+static int seed_tracked_process_tree(int tgid_map_fd, int tid_map_fd, pid_t pid,
+                                     int depth) {
   char path[128];
   char buf[4096];
   FILE *fp;
   char *cursor;
   int written;
   __u32 key;
-  __u8 value = 1;
+  int err;
 
   if (pid <= 0 || depth > 8) {
     return 0;
   }
 
   key = (__u32)pid;
-  bpf_map_update_elem(map_fd, &key, &value, BPF_ANY);
+  err = seed_single_id(tgid_map_fd, key);
+  if (err) {
+    return err;
+  }
+
+  err = seed_tracked_tids_for_pid(tid_map_fd, pid);
+  if (err) {
+    return err;
+  }
 
   written = snprintf(path, sizeof(path), "/proc/%d/task/%d/children", pid,
                      pid);
@@ -194,7 +255,11 @@ static int seed_tracked_tgid(int map_fd, pid_t pid, int depth) {
       break;
     }
     if (child > 0) {
-      seed_tracked_tgid(map_fd, (pid_t)child, depth + 1);
+      err = seed_tracked_process_tree(tgid_map_fd, tid_map_fd, (pid_t)child,
+                                      depth + 1);
+      if (err) {
+        return err;
+      }
     }
     cursor = end;
   }
@@ -204,18 +269,20 @@ static int seed_tracked_tgid(int map_fd, pid_t pid, int depth) {
 
 static int seed_tracked_tgid_tree(struct crypto_monitor_bpf *skel,
                                   pid_t root_pid) {
-  int map_fd;
+  int tgid_map_fd;
+  int tid_map_fd;
 
   if (root_pid <= 0) {
     return 0;
   }
 
-  map_fd = bpf_map__fd(skel->maps.tracked_tgids);
-  if (map_fd < 0) {
+  tgid_map_fd = bpf_map__fd(skel->maps.tracked_tgids);
+  tid_map_fd = bpf_map__fd(skel->maps.tracked_tids);
+  if (tgid_map_fd < 0 || tid_map_fd < 0) {
     return -ENOENT;
   }
 
-  return seed_tracked_tgid(map_fd, root_pid, 0);
+  return seed_tracked_process_tree(tgid_map_fd, tid_map_fd, root_pid, 0);
 }
 
 static int read_metrics_map(int map_fd, struct aggregate_snapshot *snap) {
